@@ -1,0 +1,445 @@
+import time
+import json
+import hashlib
+import requests
+from datetime import datetime, timedelta
+import pytz
+
+# Configuration
+LOGIN_URL = "https://www.bounty-news.com/api/member/login"
+ARTICLE_LIST_URL = "https://www.bounty-news.com/api/worksInfo/page"
+START_READ_URL = "https://www.bounty-news.com/api/worksInfo/startRead"
+CONTENT_GET_URL = "https://www.bounty-news.com/api/worksInfoContent/getContent"
+CLAIM_REWARD_URL = "https://www.bounty-news.com/api/worksInfo/claimReward"
+GET_AWARD_URL = "https://www.bounty-news.com/api/memberReadingReward/getAward"
+ACCOUNTS_FILE = "accounts.txt"
+MAX_ARTICLES = 20  # Target exactly 20 articles to claim points
+READ_TIME = 30  # 30 seconds before claiming reward
+CATEGORY_IDS = {
+    "coin": "1921117247997878274",  # Provided by user
+    "sport": "1921118475532247042"  # Provided by user
+}
+PAGE_SIZE = 20  # Maximum allowed
+
+# Initialize session (will be reset each run)
+session = requests.Session()
+
+def initialize_session():
+    global session
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.bounty-news.com",
+        "Referer": "https://www.bounty-news.com/",
+        "X-User-Device-Type": "chrome/124.0.0.0",
+        "X-User-System": "android 10",
+        "Language": "en_US",
+        "Memberinfoid": "33302299",
+        "Salespersonid": "161",
+        "Sec-Ch-Ua": "\"Not-A.Brand\";v=\"99\", \"Chromium\";v=\"124\"",
+        "Sec-Ch-Ua-Mobile": "?1",
+        "Sec-Ch-Ua-Platform": "\"Android\"",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Save-Data": "on"
+    })
+
+def read_accounts():
+    try:
+        with open(ACCOUNTS_FILE, 'r') as f:
+            content = f.read().strip()
+            if not content:
+                print(f"Error: {ACCOUNTS_FILE} is empty.")
+                return []
+            accounts = []
+            lines = content.split('\n')
+            for i in range(0, len(lines), 3):  # Each account: phone, password, blank line
+                if i + 1 < len(lines):
+                    phone = lines[i].strip()
+                    password = lines[i + 1].strip()
+                    if phone and password:
+                        accounts.append({"phone": phone, "password": password})
+                    else:
+                        print(f"Warning: Skipping invalid account entry at line {i + 1}")
+                else:
+                    print(f"Warning: Incomplete account entry at line {i + 1}")
+            if not accounts:
+                print(f"Error: No valid accounts found in {ACCOUNTS_FILE}.")
+            return accounts
+    except FileNotFoundError:
+        print(f"Error: {ACCOUNTS_FILE} not found.")
+        return []
+    except Exception as e:
+        print(f"Error reading {ACCOUNTS_FILE}: {e}")
+        return []
+
+def hash_password(password):
+    return hashlib.md5(password.encode()).hexdigest()
+
+def login(phone, password):
+    login_data = {
+        "phone": phone,
+        "password": hash_password(password)
+    }
+    try:
+        print(f"Sending login payload for {phone}: {json.dumps(login_data, indent=2)}")
+        response = session.post(LOGIN_URL, json=login_data)
+        response.raise_for_status()
+        data = response.json()
+        print(f"Login response for {phone}:", json.dumps(data, indent=2))
+        if not data.get("success") == True or data.get("code") != 0:
+            print(f"Login failed for {phone}. Check phone, password, or response format.")
+            return None, None
+        print(f"Login successful for {phone}!")
+        token = data.get("result", {}).get("token")
+        session.headers.update({"Authorization": f"Bearer {token}"})
+        print(f"Token for {phone}: {token}")
+        return session, token
+    except (requests.RequestException, ValueError) as e:
+        print(f"Login error for {phone}: {e}")
+        if 'response' in locals():
+            print(f"Response text for {phone}:", response.text)
+        return None, None
+
+def fetch_works_info_content_id(session, works_info_id):
+    try:
+        payload = {"id": works_info_id}
+        print(f"Fetching worksInfoContentId for worksInfoId: {works_info_id}")
+        print(f"Request headers: {json.dumps(dict(session.headers), indent=2)}")
+        print(f"Request payload: {json.dumps(payload, indent=2)}")
+        response = session.post(CONTENT_GET_URL, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        print(f"Content get response: {json.dumps(data, indent=2)}")
+        if data.get("success") == True and data.get("result"):
+            works_info_content_id = data["result"][0].get("id")
+            if works_info_content_id:
+                print(f"Successfully fetched worksInfoContentId: {works_info_content_id}")
+                return works_info_content_id
+            print(f"No worksInfoContentId found in response for worksInfoId: {works_info_id}")
+        else:
+            print(f"Failed to fetch worksInfoContentId: {data.get('businessMessage')}")
+        return None
+    except (requests.RequestException, ValueError) as e:
+        print(f"Error fetching worksInfoContentId for {works_info_id}: {e}")
+        if 'response' in locals():
+            print("Response text:", response.text)
+        return None
+
+def count_total_articles(session, category):
+    payload = {
+        "pageNo": 1,
+        "pageSize": PAGE_SIZE,
+        "categoryId": CATEGORY_IDS[category]
+    }
+    try:
+        print(f"Counting articles (category {category}, page 1): {json.dumps(payload, indent=2)}")
+        response = session.post(ARTICLE_LIST_URL, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        print(f"Article list response (category {category}, page 1): {json.dumps(data, indent=2)}")
+        if not data.get("success") == True:
+            print(f"Failed to fetch article list for category {category}: {data.get('message')}")
+            return 0
+
+        # Check if the response contains a 'total' field
+        result = data.get("result", {})
+        total = result.get("total", 0)  # Default to 0 if 'total' is not present
+        if total:
+            try:
+                total = int(total)  # Convert to integer
+                print(f"Total articles for category {category} (from 'total' field): {total}")
+                return total
+            except (ValueError, TypeError):
+                print(f"Invalid 'total' value in response: {total}. Falling back to pagination method.")
+        else:
+            print("No 'total' field found in response. Falling back to pagination method.")
+
+        # Fallback to pagination if 'total' field is not available or invalid
+        total = 0
+        page_no = 1
+        while True:
+            payload["pageNo"] = page_no
+            response = session.post(ARTICLE_LIST_URL, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("success") == True:
+                print(f"Failed to count articles on page {page_no} for category {category}: {data.get('message')}")
+                break
+            article_list = data.get("result", {}).get("list", [])
+            if not article_list:
+                break
+            total += len(article_list)
+            page_no += 1
+            if len(article_list) < PAGE_SIZE:
+                break
+        return total
+    except (requests.RequestException, ValueError) as e:
+        print(f"Error counting articles for category {category}: {e}")
+        if 'response' in locals():
+            print("Response text:", response.text)
+        return 0
+
+def get_next_article(session, processed_works_info_ids, page_no, category):
+    while True:
+        payload = {
+            "pageNo": page_no,
+            "pageSize": PAGE_SIZE,
+            "categoryId": CATEGORY_IDS[category]
+        }
+        try:
+            print(f"Fetching article list (page {page_no}, category {category}): {json.dumps(payload, indent=2)}")
+            response = session.post(ARTICLE_LIST_URL, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            print(f"Article list response (page {page_no}, category {category}): {json.dumps(data, indent=2)}")
+            if not data.get("success") == True:
+                print(f"Failed to fetch article list on page {page_no} for category {category}: {data.get('message')}")
+                return None, page_no
+
+            article_list = data.get("result", {}).get("list", [])
+            if not article_list:
+                print(f"No more articles available on page {page_no} for category {category}.")
+                return None, page_no
+
+            # Find the first unprocessed article
+            for article in article_list:
+                works_info_id = article.get("id")
+                if works_info_id in processed_works_info_ids:
+                    continue  # Skip already processed articles
+                works_info_content_id = fetch_works_info_content_id(session, works_info_id)
+                if works_info_content_id:
+                    return {
+                        "worksInfoContentId": works_info_content_id,
+                        "worksInfoId": works_info_id
+                    }, page_no
+                print(f"Skipping article with worksInfoId {works_info_id} due to missing worksInfoContentId")
+
+            # If no unprocessed articles on this page, move to the next page
+            page_no += 1
+            if len(article_list) < PAGE_SIZE:
+                print(f"Reached the end of available articles for category {category}.")
+                return None, page_no
+
+        except (requests.RequestException, ValueError) as e:
+            print(f"Error fetching article list on page {page_no} for category {category}: {e}")
+            return None, page_no
+
+def start_reading_and_claim(session, article, article_number):
+    payload = {
+        "worksInfoContentId": article["worksInfoContentId"],
+        "worksInfoId": article["worksInfoId"]
+    }
+    try:
+        print(f"[{article_number}/{MAX_ARTICLES}] Starting reading for article: {payload['worksInfoContentId']}")
+        response = session.post(START_READ_URL, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        print("Start read response:", json.dumps(data, indent=2))
+        if data.get("success") == True:
+            print(f"Waiting {READ_TIME} seconds for reading to complete...")
+            time.sleep(READ_TIME)
+            print(f"Attempting to claim reward for article {payload['worksInfoContentId']}...")
+            claim_response = session.post(CLAIM_REWARD_URL, json=payload)
+            claim_response.raise_for_status()
+            claim_data = claim_response.json()
+            print("Claim reward response:", json.dumps(claim_data, indent=2))
+            if claim_data.get("success") == True:
+                print(f"Successfully claimed reward for article {payload['worksInfoContentId']}.")
+                return True
+            else:
+                print(f"Failed to claim reward for article {payload['worksInfoContentId']}: {claim_data.get('message')}")
+                return False
+        else:
+            print(f"Failed to start reading for article {payload['worksInfoContentId']}: {data.get('message')}")
+            return False
+    except (requests.RequestException, ValueError) as e:
+        print(f"Error processing article {payload['worksInfoContentId']}: {e}")
+        if 'response' in locals():
+            print("Response text:", response.text)
+        if 'claim_response' in locals():
+            print("Claim response text:", claim_response.text)
+        return False
+
+def claim_reading_rewards(session, articles_processed):
+    claimed_levels = set()
+
+    # Separate request for workInfoReadingNum: 1
+    if articles_processed >= 1:
+        payload = {"workInfoReadingNum": 1}
+        try:
+            print(f"Separate Request 1 - Claiming reward for reading 1 article: {json.dumps(payload, indent=2)}")
+            response = session.post(GET_AWARD_URL, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            print(f"Get award response for 1 article:", json.dumps(data, indent=2))
+            if data.get("success") == True:
+                print("Successfully claimed reward for reading 1 article.")
+                claimed_levels.add(1)
+            else:
+                print(f"Failed to claim reward for 1 article: {data.get('message')}")
+        except (requests.RequestException, ValueError) as e:
+            print(f"Error claiming reward for 1 article: {e}")
+            if 'response' in locals():
+                print("Response text:", response.text)
+
+    # Separate request for workInfoReadingNum: 2
+    if articles_processed >= 2:
+        payload = {"workInfoReadingNum": 2}
+        try:
+            print(f"Separate Request 2 - Claiming reward for reading 2 articles: {json.dumps(payload, indent=2)}")
+            response = session.post(GET_AWARD_URL, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            print(f"Get award response for 2 articles:", json.dumps(data, indent=2))
+            if data.get("success") == True:
+                print("Successfully claimed reward for reading 2 articles.")
+                claimed_levels.add(2)
+            else:
+                print(f"Failed to claim reward for 2 articles: {data.get('message')}")
+        except (requests.RequestException, ValueError) as e:
+            print(f"Error claiming reward for 2 articles: {e}")
+            if 'response' in locals():
+                print("Response text:", response.text)
+
+    # Separate request for workInfoReadingNum: 5
+    if articles_processed >= 5:
+        payload = {"workInfoReadingNum": 5}
+        try:
+            print(f"Separate Request 3 - Claiming reward for reading 5 articles: {json.dumps(payload, indent=2)}")
+            response = session.post(GET_AWARD_URL, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            print(f"Get award response for 5 articles:", json.dumps(data, indent=2))
+            if data.get("success") == True:
+                print("Successfully claimed reward for reading 5 articles.")
+                claimed_levels.add(5)
+            else:
+                print(f"Failed to claim reward for 5 articles: {data.get('message')}")
+        except (requests.RequestException, ValueError) as e:
+            print(f"Error claiming reward for 5 articles: {e}")
+            if 'response' in locals():
+                print("Response text:", response.text)
+
+    # Separate request for workInfoReadingNum: 10
+    if articles_processed >= 10:
+        payload = {"workInfoReadingNum": 10}
+        try:
+            print(f"Separate Request 4 - Claiming reward for reading 10 articles: {json.dumps(payload, indent=2)}")
+            response = session.post(GET_AWARD_URL, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            print(f"Get award response for 10 articles:", json.dumps(data, indent=2))
+            if data.get("success") == True:
+                print("Successfully claimed reward for reading 10 articles.")
+                claimed_levels.add(10)
+            else:
+                print(f"Failed to claim reward for 10 articles: {data.get('message')}")
+        except (requests.RequestException, ValueError) as e:
+            print(f"Error claiming reward for 10 articles: {e}")
+            if 'response' in locals():
+                print("Response text:", response.text)
+
+    # Separate request for workInfoReadingNum: 20
+    if articles_processed >= 20:
+        payload = {"workInfoReadingNum": 20}
+        try:
+            print(f"Separate Request 5 - Claiming reward for reading 20 articles: {json.dumps(payload, indent=2)}")
+            response = session.post(GET_AWARD_URL, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            print(f"Get award response for 20 articles:", json.dumps(data, indent=2))
+            if data.get("success") == True:
+                print("Successfully claimed reward for reading 20 articles.")
+                claimed_levels.add(20)
+            else:
+                print(f"Failed to claim reward for 20 articles: {data.get('message')}")
+        except (requests.RequestException, ValueError) as e:
+            print(f"Error claiming reward for 20 articles: {e}")
+            if 'response' in locals():
+                print("Response text:", response.text)
+
+    return claimed_levels
+
+def process_account(account):
+    phone = account["phone"]
+    print(f"\nProcessing account: {phone}")
+    initialize_session()
+    session, token = login(phone, account["password"])
+    if not session or not token:
+        print(f"Skipping account {phone} due to login failure.")
+        return
+
+    # Pre-calculate total articles immediately after login
+    print(f"Fetching article counts for {phone}...")
+    total_coin = count_total_articles(session, "coin")
+    total_sport = count_total_articles(session, "sport")
+    print(f"Total articles in 'coin' category for {phone}: {total_coin}")
+    print(f"Total articles in 'sport' category for {phone}: {total_sport}")
+    print(f"Total articles across both categories for {phone}: {total_coin + total_sport}")
+
+    # Proceed with article processing (continuation prompt removed)
+    processed_works_info_ids = set()
+    articles_processed = 0
+    category_cycle = ["coin", "sport"]  # Alternate between coin and sport
+    category_pages = {"coin": 1, "sport": 1}  # Track page numbers for each category
+
+    while articles_processed < MAX_ARTICLES:
+        category = category_cycle[articles_processed % 2]
+        page_no = category_pages[category]
+
+        article, new_page_no = get_next_article(session, processed_works_info_ids, page_no, category)
+        if not article:
+            print(f"No more articles to process in category {category} for {phone}.")
+            category_cycle = [c for c in category_cycle if c != category]
+            if not category_cycle:
+                print(f"Insufficient articles available for {phone}. Processed {articles_processed} articles.")
+                break
+            continue
+
+        category_pages[category] = new_page_no
+        if start_reading_and_claim(session, article, articles_processed + 1):
+            processed_works_info_ids.add(article["worksInfoId"])
+            articles_processed += 1
+        else:
+            print(f"Skipping article {article['worksInfoId']} for {phone} due to server rejection or error.")
+
+    # Proceed with getAward claims after all articles are processed
+    print(f"All {articles_processed} articles processed for {phone}. Proceeding with reward claims...")
+    claimed_levels = claim_reading_rewards(session, articles_processed)
+    print(f"Account {phone} completed. Processed {articles_processed} articles.")
+    print(f"Reward levels claimed for {phone}: {sorted(claimed_levels)}")
+    print(f"Check account {phone} to confirm readings and rewards are reflected.")
+
+def main():
+    accounts = read_accounts()
+    if not accounts:
+        print("No accounts to process. Script aborted.")
+        return
+    for account in accounts:
+        process_account(account)
+
+def schedule_daily_run():
+    nigeria_tz = pytz.timezone("Africa/Lagos")
+    while True:
+        # Get current time in Nigeria
+        now = datetime.now(nigeria_tz)
+        # Set next run to 1:03 AM today
+        next_run = now.replace(hour=1, minute=3, second=0, microsecond=0)
+        # If 1:03 AM has passed, set to tomorrow
+        if now > next_run:
+            next_run += timedelta(days=1)
+        # Calculate seconds until next run
+        seconds_until_run = (next_run - now).total_seconds()
+        print(f"Next run scheduled at {next_run.strftime('%Y-%m-%d %H:%M:%S %Z')}. Sleeping for {seconds_until_run:.0f} seconds...")
+        time.sleep(seconds_until_run)
+        print(f"Starting script at {datetime.now(nigeria_tz).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        main()
+
+if __name__ == "__main__":
+    schedule_daily_run()
